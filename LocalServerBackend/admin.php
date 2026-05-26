@@ -18,6 +18,7 @@ $error   = '';
 $message = '';
 $results = null;
 $columns = [];
+$sqlFileContent = null; // holds file contents when "View" is clicked
 
 // Handle login
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['password'])) {
@@ -51,7 +52,7 @@ $presets = [
     'clear_all'          => 'SET FOREIGN_KEY_CHECKS=0; TRUNCATE TABLE roundLogs; TRUNCATE TABLE habitSurvey; TRUNCATE TABLE rounds; TRUNCATE TABLE participants; SET FOREIGN_KEY_CHECKS=1',
 ];
 
-// Find all .sql files in the api directory — never directly accessible via URL
+// Find all .sql files in the sql subdirectory
 function getSqlFiles() {
     $files = glob(__DIR__ . '/sql/*.sql');
     if (!$files) return [];
@@ -59,10 +60,8 @@ function getSqlFiles() {
 }
 
 // Execute a SQL string that may contain multiple statements
-// Returns [$ok, $message, $error, $rows, $columns]
 function runSql($db, $sql) {
     try {
-        // Split on semicolons but ignore empty segments
         $statements = array_filter(array_map('trim', explode(';', $sql)));
 
         if (empty($statements)) {
@@ -75,16 +74,13 @@ function runSql($db, $sql) {
         foreach ($statements as $stmt) {
             if (empty($stmt)) continue;
 
-            // Use mysqli_query with error suppression; check $db->error manually
             $result = @$db->query($stmt);
 
             if ($result === false) {
-                // Return the MySQL error message — never crash the page
                 return [false, '', 'MySQL error: ' . $db->error, null, []];
             }
 
             if ($result !== true) {
-                // SELECT-type query — fetch results
                 $fields      = $result->fetch_fields();
                 $lastColumns = $fields ? array_column($fields, 'name') : [];
                 $lastRows    = $result->fetch_all(MYSQLI_ASSOC);
@@ -98,64 +94,74 @@ function runSql($db, $sql) {
         return [true, 'Executed successfully. Rows affected: ' . $db->affected_rows, '', null, []];
 
     } catch (Throwable $e) {
-        // Catch any unexpected PHP error so the page never white-screens
         return [false, '', 'Unexpected error: ' . $e->getMessage(), null, []];
     }
 }
 
-// Handle all POST actions requiring a DB connection
-if ($authed && $_SERVER['REQUEST_METHOD'] === 'POST' &&
-    (isset($_POST['run_query']) || isset($_POST['preset']) || isset($_POST['run_sql_file']))) {
+// Handle all POST actions
+if ($authed && $_SERVER['REQUEST_METHOD'] === 'POST') {
 
-    $db = new mysqli(
-        getenv('DB_HOST') ?: 'localhost',
-        getenv('DB_USER'),
-        getenv('DB_PASSWORD'),
-        getenv('DB_NAME'),
-        getenv('DB_PORT') ?: 3306
-    );
+    // ── View SQL file (no DB needed) ────────────────────────────────────
+    if (isset($_POST['view_sql_file']) && isset($_POST['sql_file'])) {
+        $requestedFile = basename($_POST['sql_file']);
+        $filePath      = __DIR__ . '/sql/' . $requestedFile;
 
-    if ($db->connect_error) {
-        $error = 'DB connection failed: ' . $db->connect_error;
-    } else {
-        $sql            = '';
-        $message_prefix = '';
-
-        // Preset
-        if (isset($_POST['preset']) && isset($presets[$_POST['preset']])) {
-            $sql = $presets[$_POST['preset']];
+        if (!preg_match('/\.sql$/', $requestedFile) || !file_exists($filePath)) {
+            $error = 'Invalid or missing SQL file: ' . htmlspecialchars($requestedFile);
+        } else {
+            $sqlFileContent = file_get_contents($filePath);
+            $message        = 'Viewing: ' . htmlspecialchars($requestedFile);
         }
 
-        // Custom query
-        if (isset($_POST['run_query']) && isset($_POST['query'])) {
-            $sql = trim($_POST['query']);
-        }
+    } elseif (isset($_POST['run_query']) || isset($_POST['preset']) || isset($_POST['run_sql_file'])) {
 
-        // SQL file loader — basename() prevents path traversal attacks
-        if (isset($_POST['run_sql_file']) && isset($_POST['sql_file'])) {
-            $requestedFile = basename($_POST['sql_file']);
-            $filePath      = __DIR__ . '/sql/' . $requestedFile;
+        $db = new mysqli(
+            getenv('DB_HOST') ?: 'localhost',
+            getenv('DB_USER'),
+            getenv('DB_PASSWORD'),
+            getenv('DB_NAME'),
+            getenv('DB_PORT') ?: 3306
+        );
 
-            if (!preg_match('/\.sql$/', $requestedFile) || !file_exists($filePath)) {
-                $error = 'Invalid or missing SQL file: ' . htmlspecialchars($requestedFile);
-            } else {
-                $sql            = file_get_contents($filePath);
-                $message_prefix = 'File: ' . htmlspecialchars($requestedFile) . ' — ';
+        if ($db->connect_error) {
+            $error = 'DB connection failed: ' . $db->connect_error;
+        } else {
+            $sql            = '';
+            $message_prefix = '';
+
+            if (isset($_POST['preset']) && isset($presets[$_POST['preset']])) {
+                $sql = $presets[$_POST['preset']];
             }
-        }
 
-        if ($sql && !$error) {
-            [$ok, $msg, $err, $rows, $cols] = runSql($db, $sql);
-            if ($ok) {
-                $message = $message_prefix . $msg;
-                $results = $rows;
-                $columns = $cols;
-            } else {
-                $error = $err;
+            if (isset($_POST['run_query']) && isset($_POST['query'])) {
+                $sql = trim($_POST['query']);
             }
-        }
 
-        $db->close();
+            if (isset($_POST['run_sql_file']) && isset($_POST['sql_file'])) {
+                $requestedFile = basename($_POST['sql_file']);
+                $filePath      = __DIR__ . '/sql/' . $requestedFile;
+
+                if (!preg_match('/\.sql$/', $requestedFile) || !file_exists($filePath)) {
+                    $error = 'Invalid or missing SQL file: ' . htmlspecialchars($requestedFile);
+                } else {
+                    $sql            = file_get_contents($filePath);
+                    $message_prefix = 'File: ' . htmlspecialchars($requestedFile) . ' — ';
+                }
+            }
+
+            if ($sql && !$error) {
+                [$ok, $msg, $err, $rows, $cols] = runSql($db, $sql);
+                if ($ok) {
+                    $message = $message_prefix . $msg;
+                    $results = $rows;
+                    $columns = $cols;
+                } else {
+                    $error = $err;
+                }
+            }
+
+            $db->close();
+        }
     }
 }
 ?>
@@ -317,8 +323,7 @@ if ($authed && $_SERVER['REQUEST_METHOD'] === 'POST' &&
         .sql-file-row {
             display: flex;
             align-items: center;
-            justify-content: space-between;
-            gap: 0.5rem;
+            gap: 0.4rem;
             padding: 0.4rem 0.5rem;
             background: #111;
         }
@@ -332,6 +337,12 @@ if ($authed && $_SERVER['REQUEST_METHOD'] === 'POST' &&
             white-space: nowrap;
         }
 
+        .sql-file-row .file-actions {
+            display: flex;
+            gap: 0.3rem;
+            flex-shrink: 0;
+        }
+
         .sql-file-row button {
             background: none;
             border: 1px solid #333;
@@ -342,14 +353,33 @@ if ($authed && $_SERVER['REQUEST_METHOD'] === 'POST' &&
             cursor: pointer;
             letter-spacing: 0.1em;
             text-transform: uppercase;
-            flex-shrink: 0;
         }
 
         .sql-file-row button:hover { background: #00ff88; color: #0f0f0f; border-color: #00ff88; }
 
+        .sql-file-row button.btn-view {
+            color: #aaa;
+            border-color: #333;
+        }
+
+        .sql-file-row button.btn-view:hover { background: #333; color: #fff; border-color: #555; }
+
         .no-files { font-size: 0.75rem; color: #444; }
 
         .results-panel { overflow-x: auto; }
+
+        /* SQL source viewer */
+        .sql-source {
+            background: #0f0f0f;
+            border: 1px solid #2a2a2a;
+            padding: 1rem;
+            font-size: 0.8rem;
+            line-height: 1.7;
+            color: #ccc;
+            white-space: pre-wrap;
+            word-break: break-word;
+            overflow-x: auto;
+        }
 
         table { width: 100%; border-collapse: collapse; font-size: 0.78rem; }
 
@@ -476,16 +506,26 @@ if ($authed && $_SERVER['REQUEST_METHOD'] === 'POST' &&
             <h2>SQL Files</h2>
             <?php $sqlFiles = getSqlFiles(); ?>
             <?php if (empty($sqlFiles)): ?>
-                <div class="no-files">No .sql files found in the api directory.</div>
+                <div class="no-files">No .sql files found in the sql directory.</div>
             <?php else: ?>
                 <div class="sql-file-list">
                     <?php foreach ($sqlFiles as $file): ?>
-                        <form method="POST" class="sql-file-row"
-                              onsubmit="return confirm('Run <?= htmlspecialchars($file, ENT_QUOTES) ?>?\nThis may modify the database.')">
-                            <input type="hidden" name="sql_file" value="<?= htmlspecialchars($file) ?>">
+                        <div class="sql-file-row">
                             <span title="<?= htmlspecialchars($file) ?>"><?= htmlspecialchars($file) ?></span>
-                            <button type="submit" name="run_sql_file" value="1">Run</button>
-                        </form>
+                            <div class="file-actions">
+                                <!-- View button — no confirm needed, read-only -->
+                                <form method="POST">
+                                    <input type="hidden" name="sql_file" value="<?= htmlspecialchars($file) ?>">
+                                    <button type="submit" name="view_sql_file" value="1" class="btn-view">View</button>
+                                </form>
+                                <!-- Run button -->
+                                <form method="POST"
+                                      onsubmit="return confirm('Run <?= htmlspecialchars($file, ENT_QUOTES) ?>?\nThis may modify the database.')">
+                                    <input type="hidden" name="sql_file" value="<?= htmlspecialchars($file) ?>">
+                                    <button type="submit" name="run_sql_file" value="1">Run</button>
+                                </form>
+                            </div>
+                        </div>
                     <?php endforeach; ?>
                 </div>
             <?php endif; ?>
@@ -512,7 +552,10 @@ if ($authed && $_SERVER['REQUEST_METHOD'] === 'POST' &&
             <div class="success"><?= htmlspecialchars($message) ?></div>
         <?php endif; ?>
 
-        <?php if ($results !== null && count($results) > 0): ?>
+        <?php if ($sqlFileContent !== null): ?>
+            <pre class="sql-source"><?= htmlspecialchars($sqlFileContent) ?></pre>
+
+        <?php elseif ($results !== null && count($results) > 0): ?>
             <table>
                 <thead>
                     <tr><?php foreach ($columns as $col): ?><th><?= htmlspecialchars($col) ?></th><?php endforeach; ?></tr>
