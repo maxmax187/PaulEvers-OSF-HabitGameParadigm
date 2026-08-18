@@ -1,0 +1,1 @@
+select email, totalscore from p order by totalscore desc;
